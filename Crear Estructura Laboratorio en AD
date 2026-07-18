@@ -117,7 +117,7 @@ function Get-UniqueSamAccountName {
 
     while ($Global:UsedSamAccounts.ContainsKey($candidate)) {
         $i++
-        $candidate = "$base$i"   # alejandro.ruiz2, alejandro.ruiz3, ...
+        $candidate = "$base$i"
     }
 
     $Global:UsedSamAccounts[$candidate] = $true
