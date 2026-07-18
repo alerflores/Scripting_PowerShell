@@ -1,0 +1,274 @@
+<#
+.SYNOPSIS
+    Crea una estructura de laboratorio en Active Directory:
+    - OU raíz con sub-OUs por departamento (Usuarios / Equipos dentro de cada una)
+    - ~1000 usuarios repartidos entre los departamentos, con nombre y apellidos reales
+    - sAMAccountName y UPN únicos en formato nombre.apellido (sin tildes/espacios)
+    - Un grupo de seguridad por departamento, con los usuarios como miembros
+    - Objetos de equipo de ejemplo por departamento
+
+.NOTAS
+    - Requiere el módulo ActiveDirectory (RSAT) y ejecutarse con permisos suficientes
+      sobre el dominio (normalmente como Domain Admin) desde un DC o una máquina con RSAT.
+    - Ajusta $DomainDN, $UPNSuffix y $UsersPerDept a tu entorno antes de ejecutar.
+    - Ejecuta primero en un entorno de pruebas / laboratorio.
+#>
+
+#Requires -Modules ActiveDirectory
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+# ============================================================
+#  CONFIGURACIÓN GENERAL
+# ============================================================
+
+# DN base del dominio. Ajusta a tu dominio real, ej: "DC=lab,DC=local"
+$DomainDN   = (Get-ADDomain).DistinguishedName
+$UPNSuffix  = (Get-ADDomain).DNSRoot
+
+# Nombre de la OU raíz del laboratorio
+$RootOUName = "Laboratorio"
+$RootOUPath = $DomainDN
+
+# Contraseña inicial para todos los usuarios de prueba (cámbiala / usa una política real)
+$DefaultPassword = ConvertTo-SecureString "P@ssw0rd2026!" -AsPlainText -Force
+
+# Departamentos y nº orientativo de usuarios por departamento (suman ~1000)
+$Departamentos = [ordered]@{
+    "Direccion"          = 30
+    "IT"                 = 120
+    "RRHH"               = 60
+    "Finanzas"           = 90
+    "Ventas"             = 220
+    "Marketing"          = 80
+    "Operaciones"        = 180
+    "Logistica"          = 120
+    "AtencionCliente"    = 70
+    "Legal"              = 30
+}
+
+# Nº de equipos de ejemplo a crear por departamento
+$EquiposPorDepto = 5
+
+# ============================================================
+#  LISTAS DE NOMBRES Y APELLIDOS (ES)
+# ============================================================
+
+$NombresHombre = @(
+    "Alejandro","Antonio","Manuel","Francisco","David","Javier","Daniel","Jose",
+    "Carlos","Miguel","Rafael","Pedro","Angel","Sergio","Fernando","Pablo",
+    "Jorge","Alberto","Luis","Alvaro","Adrian","Diego","Ivan","Ruben",
+    "Victor","Raul","Oscar","Gonzalo","Marcos","Ismael","Hugo","Enrique",
+    "Ricardo","Cesar","Emilio","Guillermo","Nicolas","Andres","Roberto","Tomas"
+)
+
+$NombresMujer = @(
+    "Maria","Carmen","Ana","Isabel","Laura","Cristina","Marta","Elena",
+    "Lucia","Paula","Sara","Sofia","Andrea","Patricia","Beatriz","Silvia",
+    "Raquel","Rosa","Alicia","Monica","Natalia","Irene","Nuria","Eva",
+    "Teresa","Pilar","Julia","Claudia","Alba","Noelia","Susana","Yolanda",
+    "Lorena","Marina","Veronica","Angela","Gloria","Sandra","Ines","Carla"
+)
+
+$Apellidos = @(
+    "Garcia","Rodriguez","Gonzalez","Fernandez","Lopez","Martinez","Sanchez",
+    "Perez","Gomez","Martin","Jimenez","Ruiz","Hernandez","Diaz","Moreno",
+    "Alvarez","Munoz","Romero","Alonso","Gutierrez","Navarro","Torres",
+    "Dominguez","Vazquez","Ramos","Gil","Ramirez","Serrano","Blanco","Molina",
+    "Morales","Suarez","Ortega","Delgado","Castro","Ortiz","Rubio","Marin",
+    "Sanz","Iglesias","Nunez","Medina","Garrido","Santos","Castillo","Cortes",
+    "Lozano","Guerrero","Cano","Prieto","Mendez","Cruz","Herrera","Pena",
+    "Flores","Vega","Reyes","Leon","Cabrera","Vidal"
+)
+
+# ============================================================
+#  FUNCIONES AUXILIARES
+# ============================================================
+
+function Remove-Diacritics {
+    param([string]$Text)
+    $normalized = $Text.Normalize([Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($c in $normalized.ToCharArray()) {
+        $cat = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($c)
+        if ($cat -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($c)
+        }
+    }
+    return $sb.ToString().Normalize([Text.NormalizationForm]::FormC)
+}
+
+# Hashtable global para garantizar unicidad de sAMAccountName
+$Global:UsedSamAccounts = @{}
+
+function Get-UniqueSamAccountName {
+    param(
+        [string]$Nombre,
+        [string]$Apellido1,
+        [string]$Apellido2
+    )
+
+    $n  = (Remove-Diacritics $Nombre).ToLower()
+    $a1 = (Remove-Diacritics $Apellido1).ToLower()
+
+    $base = "$n.$a1"
+    $candidate = $base
+    $i = 1
+
+    while ($Global:UsedSamAccounts.ContainsKey($candidate)) {
+        $i++
+        $candidate = "$base$i"   # alejandro.ruiz2, alejandro.ruiz3, ...
+    }
+
+    $Global:UsedSamAccounts[$candidate] = $true
+    return $candidate
+}
+
+# ============================================================
+#  1. CREAR OU RAÍZ Y ESTRUCTURA POR DEPARTAMENTO
+# ============================================================
+
+Write-Host "== Creando OU raiz '$RootOUName' ==" -ForegroundColor Cyan
+
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$RootOUName'" -SearchBase $RootOUPath -ErrorAction SilentlyContinue)) {
+    New-ADOrganizationalUnit -Name $RootOUName -Path $RootOUPath -ProtectedFromAccidentalDeletion $true
+}
+$RootOUDN = "OU=$RootOUName,$RootOUPath"
+
+foreach ($Depto in $Departamentos.Keys) {
+
+    Write-Host "== Creando estructura para departamento: $Depto ==" -ForegroundColor Cyan
+
+    # OU del departamento
+    if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$Depto'" -SearchBase $RootOUDN -ErrorAction SilentlyContinue)) {
+        New-ADOrganizationalUnit -Name $Depto -Path $RootOUDN -ProtectedFromAccidentalDeletion $true
+    }
+    $DeptoOUDN = "OU=$Depto,$RootOUDN"
+
+    # Sub-OU Usuarios
+    if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Usuarios'" -SearchBase $DeptoOUDN -ErrorAction SilentlyContinue)) {
+        New-ADOrganizationalUnit -Name "Usuarios" -Path $DeptoOUDN -ProtectedFromAccidentalDeletion $true
+    }
+
+    # Sub-OU Equipos
+    if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Equipos'" -SearchBase $DeptoOUDN -ErrorAction SilentlyContinue)) {
+        New-ADOrganizationalUnit -Name "Equipos" -Path $DeptoOUDN -ProtectedFromAccidentalDeletion $true
+    }
+
+    # Sub-OU Grupos
+    if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Grupos'" -SearchBase $DeptoOUDN -ErrorAction SilentlyContinue)) {
+        New-ADOrganizationalUnit -Name "Grupos" -Path $DeptoOUDN -ProtectedFromAccidentalDeletion $true
+    }
+}
+
+# ============================================================
+#  2. CREAR GRUPOS DE SEGURIDAD POR DEPARTAMENTO
+# ============================================================
+
+Write-Host "`n== Creando grupos de seguridad por departamento ==" -ForegroundColor Cyan
+
+foreach ($Depto in $Departamentos.Keys) {
+    $GroupName = "GRP_$Depto"
+    $GroupOUDN = "OU=Grupos,OU=$Depto,$RootOUDN"
+
+    if (-not (Get-ADGroup -Filter "Name -eq '$GroupName'" -SearchBase $RootOUDN -ErrorAction SilentlyContinue)) {
+        New-ADGroup -Name $GroupName `
+                    -SamAccountName $GroupName `
+                    -GroupScope Global `
+                    -GroupCategory Security `
+                    -Path $GroupOUDN `
+                    -Description "Grupo del departamento $Depto"
+    }
+}
+
+# ============================================================
+#  3. CREAR USUARIOS
+# ============================================================
+
+Write-Host "`n== Creando usuarios (~1000 en total) ==" -ForegroundColor Cyan
+
+$TotalCreados = 0
+
+foreach ($Depto in $Departamentos.Keys) {
+
+    $NumUsuarios = $Departamentos[$Depto]
+    $UsersOUDN   = "OU=Usuarios,OU=$Depto,$RootOUDN"
+    $GroupName   = "GRP_$Depto"
+
+    Write-Host "-> $Depto : creando $NumUsuarios usuarios..." -ForegroundColor Yellow
+
+    for ($i = 1; $i -le $NumUsuarios; $i++) {
+
+        # Elegir género aleatorio para el nombre
+        if ((Get-Random -Minimum 0 -Maximum 2) -eq 0) {
+            $Nombre = $NombresHombre | Get-Random
+        } else {
+            $Nombre = $NombresMujer | Get-Random
+        }
+
+        $Apellido1 = $Apellidos | Get-Random
+        $Apellido2 = $Apellidos | Get-Random
+
+        $ApellidosCompletos = "$Apellido1 $Apellido2"
+        $NombreCompleto     = "$Nombre $ApellidosCompletos"
+
+        $SamAccountName = Get-UniqueSamAccountName -Nombre $Nombre -Apellido1 $Apellido1 -Apellido2 $Apellido2
+        $UPN            = "$SamAccountName@$UPNSuffix"
+
+        try {
+            New-ADUser `
+                -Name              $NombreCompleto `
+                -GivenName         $Nombre `
+                -Surname           $ApellidosCompletos `
+                -DisplayName       $NombreCompleto `
+                -SamAccountName    $SamAccountName `
+                -UserPrincipalName $UPN `
+                -Path              $UsersOUDN `
+                -Department        $Depto `
+                -AccountPassword   $DefaultPassword `
+                -ChangePasswordAtLogon $true `
+                -Enabled           $true `
+                -ErrorAction Stop
+
+            # Añadir al grupo del departamento
+            Add-ADGroupMember -Identity $GroupName -Members $SamAccountName
+
+            $TotalCreados++
+        }
+        catch {
+            Write-Warning "Error creando usuario $SamAccountName : $_"
+        }
+    }
+}
+
+Write-Host "`nTotal de usuarios creados: $TotalCreados" -ForegroundColor Green
+
+# ============================================================
+#  4. CREAR EQUIPOS DE EJEMPLO POR DEPARTAMENTO
+# ============================================================
+
+Write-Host "`n== Creando equipos de ejemplo ==" -ForegroundColor Cyan
+
+foreach ($Depto in $Departamentos.Keys) {
+
+    $EquiposOUDN = "OU=Equipos,OU=$Depto,$RootOUDN"
+    $Prefijo     = ($Depto.Substring(0, [Math]::Min(3, $Depto.Length))).ToUpper()
+
+    for ($i = 1; $i -le $EquiposPorDepto; $i++) {
+        $NombreEquipo = "PC-$Prefijo-{0:D3}" -f $i
+
+        if (-not (Get-ADComputer -Filter "Name -eq '$NombreEquipo'" -SearchBase $RootOUDN -ErrorAction SilentlyContinue)) {
+            try {
+                New-ADComputer -Name $NombreEquipo -Path $EquiposOUDN -Enabled $true
+            }
+            catch {
+                Write-Warning "Error creando equipo $NombreEquipo : $_"
+            }
+        }
+    }
+}
+
+Write-Host "`n== Proceso completado ==" -ForegroundColor Green
+Write-Host "OU raiz: $RootOUDN"
+Write-Host "Usuarios creados: $TotalCreados"
+Write-Host "Departamentos: $($Departamentos.Keys -join ', ')"
